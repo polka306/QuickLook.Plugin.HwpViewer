@@ -9,6 +9,12 @@ on:
         required: false
         type: string
 
+      force_release:
+        description: "Release current main even if rhwp is unchanged"
+        required: false
+        default: false
+        type: boolean
+
   schedule:
     - cron: "0 18 * * *" # 매일 KST 03:00, UTC 기준
 
@@ -159,20 +165,73 @@ jobs:
           cp external/rhwp/pkg/rhwp.js ./rhwp.js
           cp external/rhwp/pkg/rhwp_bg.wasm ./rhwp_bg.wasm
 
-      - name: Check whether rhwp update changed repository
+      - name: Determine whether a new release is needed
         id: changes
-        if: steps.rhwp_check.outputs.updated == 'true'
+        if: github.event_name != 'workflow_dispatch' || inputs.release_version == ''
         shell: bash
         run: |
           set -euo pipefail
 
           if git diff --quiet -- external/rhwp rhwp.js rhwp_bg.wasm RHWP_REVISION; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
+            RHWP_CHANGED=false
             echo "No rhwp-related changes after build."
           else
-            echo "changed=true" >> "$GITHUB_OUTPUT"
+            RHWP_CHANGED=true
             echo "rhwp-related changes detected."
           fi
+
+          # 마지막 릴리스 태그 이후 플러그인 소스가 바뀌었는지도 본다.
+          # 이 검사가 없으면 소스만 고친 커밋은 rhwp가 갱신될 때까지 배포되지
+          # 않는다. 실제로 "support .hwpx"가 그렇게 묶여 있었다.
+          SOURCE_PATHS=(
+            Plugin.cs
+            index.html
+            Properties
+            Scripts
+            QuickLook.Plugin.HwpViewer.csproj
+            QuickLook.Plugin.HwpViewer.sln
+            QuickLook.Plugin.Metadata.Base.config
+          )
+
+          LAST_TAG="$(git tag --list '[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n 1)"
+
+          if [ -z "$LAST_TAG" ]; then
+            SOURCE_CHANGED=true
+            echo "No previous plugin tag; treating sources as changed."
+          elif git diff --quiet "$LAST_TAG"..HEAD -- "${SOURCE_PATHS[@]}"; then
+            SOURCE_CHANGED=false
+            echo "No plugin source changes since $LAST_TAG."
+          else
+            SOURCE_CHANGED=true
+            echo "Plugin source changes since $LAST_TAG:"
+            git diff --name-only "$LAST_TAG"..HEAD -- "${SOURCE_PATHS[@]}"
+          fi
+
+          FORCED="${{ inputs.force_release == true }}"
+
+          if [ "$RHWP_CHANGED" = "true" ] || [ "$SOURCE_CHANGED" = "true" ] || [ "$FORCED" = "true" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Nothing to release."
+          fi
+
+          echo "rhwp_changed=$RHWP_CHANGED" >> "$GITHUB_OUTPUT"
+          echo "source_changed=$SOURCE_CHANGED" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js
+        if: steps.changes.outputs.changed == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run viewer format tests
+        if: steps.changes.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          node --test tests/*.test.mjs
 
       - name: Calculate next plugin patch version
         id: version
@@ -213,7 +272,13 @@ jobs:
 
           git add external/rhwp rhwp.js rhwp_bg.wasm RHWP_REVISION
 
-          git commit -m "Update rhwp to ${{ steps.rhwp_check.outputs.rhwp_tag }}"
+          # 소스 변경만으로 릴리스할 때는 커밋할 파일이 없다. 그 경우 현재
+          # HEAD에 태그만 붙인다.
+          if git diff --cached --quiet; then
+            echo "No rhwp file changes to commit; tagging current HEAD."
+          else
+            git commit -m "Update rhwp to ${{ steps.rhwp_check.outputs.rhwp_tag }}"
+          fi
 
           git tag "${{ steps.version.outputs.plugin_version }}"
 
